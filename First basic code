@@ -1,0 +1,198 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include "esp_sleep.h"
+
+/* =========================
+   USER SETTINGS
+   ========================= */
+
+// Wi-Fi (you provided)
+static const char* WIFI_SSID = "4G_AP_E3FE";
+static const char* WIFI_PASS = "charlietheunicorn";
+
+// ThingsBoard Cloud MQTT (from your mosquitto_pub example)
+static const char* TB_SERVER = "mqtt.thingsboard.cloud";
+static const int   TB_PORT   = 1883;
+static const char* TB_TOKEN  = "e81mz1mi9xhhjg8n3arx";   // username token, password is blank
+
+// Counting / anti-double-counting lockout
+static const uint32_t LOCKOUT_SECONDS = 15;  // tune 10–30s
+
+// Optional Wi-Fi/MQTT timeouts (seconds)
+static const uint32_t WIFI_TIMEOUT_S = 12;
+static const uint32_t MQTT_TIMEOUT_S = 8;
+
+/* =========================
+   HARDWARE (XIAO ESP32C3)
+   ========================= */
+// Your serial confirmed: D0=2 => PIR is GPIO2
+static const gpio_num_t PIR_GPIO = GPIO_NUM_2;
+
+/* =========================
+   STATE (persists across deep sleep)
+   ========================= */
+RTC_DATA_ATTR uint32_t rat_count = 0;
+RTC_DATA_ATTR uint32_t boot_count = 0;
+
+/* =========================
+   MQTT
+   ========================= */
+WiFiClient espClient;
+PubSubClient mqtt(espClient);
+
+/* =========================
+   Helpers
+   ========================= */
+
+static void disconnectRadios() {
+  if (mqtt.connected()) mqtt.disconnect();
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  btStop();
+}
+
+static bool connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  const unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - t0) < WIFI_TIMEOUT_S * 1000UL) {
+    delay(200);
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("[WIFI] Connected. IP=");
+    Serial.println(WiFi.localIP());
+    return true;
+  }
+
+  Serial.println("[WIFI] Connect timeout.");
+  return false;
+}
+
+static bool connectMQTT() {
+  mqtt.setServer(TB_SERVER, TB_PORT);
+
+  const unsigned long t0 = millis();
+  while (!mqtt.connected() && (millis() - t0) < MQTT_TIMEOUT_S * 1000UL) {
+    // ThingsBoard: username = token, password = empty
+    if (mqtt.connect("xiao-esp32c3", TB_TOKEN, "")) {
+      Serial.println("[MQTT] Connected to ThingsBoard Cloud.");
+      return true;
+    }
+    delay(300);
+  }
+
+  Serial.println("[MQTT] Connect timeout.");
+  return false;
+}
+
+static void publishTelemetry(uint32_t count) {
+  // Valid JSON payload
+  String payload = String("{\"rat_count\":") + count + "}";
+
+  bool ok = mqtt.publish("v1/devices/me/telemetry", payload.c_str());
+  Serial.print("[MQTT] Publish payload=");
+  Serial.print(payload);
+  Serial.print(" -> ");
+  Serial.println(ok ? "OK" : "FAILED");
+}
+
+static void sleepPIRWake() {
+  // Wake when PIR goes HIGH
+  esp_deep_sleep_enable_gpio_wakeup(BIT(PIR_GPIO), ESP_GPIO_WAKEUP_GPIO_HIGH);
+
+  Serial.println("[SLEEP] PIR-wake deep sleep.");
+  Serial.flush();
+  delay(50);
+  esp_deep_sleep_start();
+}
+
+static void sleepLockout(uint32_t seconds) {
+  // During lockout: wake only by timer (prevents double counting from repeated PIR pulses)
+  esp_sleep_enable_timer_wakeup((uint64_t)seconds * 1000000ULL);
+
+  Serial.print("[SLEEP] Lockout deep sleep for ");
+  Serial.print(seconds);
+  Serial.println(" s.");
+  Serial.flush();
+  delay(50);
+  esp_deep_sleep_start();
+}
+
+/* =========================
+   Setup
+   ========================= */
+
+void setup() {
+  Serial.begin(115200);
+
+  // brief Serial attach window
+  unsigned long t0 = millis();
+  while (!Serial && (millis() - t0 < 2000)) delay(10);
+
+  Serial.println();
+  Serial.println("=== START ===");
+
+  boot_count++;
+  Serial.print("[BOOT] Boot number: ");
+  Serial.println(boot_count);
+
+  Serial.printf("[INFO] D0=%d, D1=%d\n", (int)D0, (int)D1);
+
+  pinMode((int)PIR_GPIO, INPUT);
+
+  const esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+  Serial.print("[BOOT] Wake cause: ");
+  Serial.println((int)cause);
+
+  // Timer wake means lockout ended -> re-arm PIR and sleep
+  if (cause == ESP_SLEEP_WAKEUP_TIMER) {
+    Serial.println("[STATE] Timer wake (lockout ended). Re-arming PIR.");
+    disconnectRadios();
+    sleepPIRWake();
+  }
+
+  // PIR wake -> count one event, publish, lockout
+  if (cause == ESP_SLEEP_WAKEUP_GPIO) {
+    Serial.println("mouse detected");
+
+    // Confirm sustained HIGH (filters occasional spurious wake)
+    bool confirmedHigh = false;
+    for (int i = 0; i < 30; i++) {
+      if (digitalRead((int)PIR_GPIO) == HIGH) { confirmedHigh = true; break; }
+      delay(10);
+    }
+    if (!confirmedHigh) {
+      Serial.println("[PIR] Not sustained HIGH. Going back to sleep.");
+      disconnectRadios();
+      sleepPIRWake();
+    }
+
+    rat_count++;
+    Serial.print("[COUNT] rat_count = ");
+    Serial.println(rat_count);
+
+    // Best-effort transmit
+    if (connectWiFi()) {
+      if (connectMQTT()) {
+        publishTelemetry(rat_count);
+      }
+    }
+
+    disconnectRadios();
+
+    // Anti-double-counting lockout sleep
+    sleepLockout(LOCKOUT_SECONDS);
+  }
+
+  // Fresh boot/reset -> arm PIR and sleep
+  Serial.println("[STATE] Fresh boot/reset. Arming PIR and sleeping.");
+  disconnectRadios();
+  sleepPIRWake();
+}
+
+void loop() {
+  // never reached
+}
